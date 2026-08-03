@@ -1,0 +1,42 @@
+# --- Python cache ---
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.benchmarks/
+.tox/
+.nox/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+
+# --- Build artifacts ---
+build/
+dist/
+wheels/
+*.whl
+*.tar.gz
+
+# --- Install / virtualenv ---
+.venv/
+venv/
+env/
+ENV/
+.venv.bak/
+venv.bak/
+pip-wheel-metadata/
+*.egg-link
+
+# --- Editor / IDE ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store

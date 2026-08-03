@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dme-mcp-server"
+version = "0.1.0"
+description = "MCP Server for DME storage O&M — exposes dme-python-sdk actions as MCP tools"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+dependencies = [
+    "mcp>=1.28,<2",
+    # dme-python-sdk repo (https://github.com/agentic-data-ops/dme-python-sdk.git)
+    # the installed package is named pydme, so the dependency name is pydme
+    "pydme @ git+https://github.com/agentic-data-ops/dme-python-sdk.git",
+]
+
+[project.scripts]
+dme-mcp-server = "dme_mcp_server.server:main"
+
+[tool.setuptools.packages.find]
+include = ["dme_mcp_server*"]
