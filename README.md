@@ -10,7 +10,7 @@ Exposes 16 action modules (427 actions) from `dme-python-sdk` as MCP V1 tools
 - **Tool naming**: dot-separated `<topic>.<action_key>` (e.g. `san.lun.list`)
 - **Annotation**: every tool carries `meta = {"topic", "subtopic", "action"}`
 - **Docstring parsing**: action function docstrings are parsed into the tool's `description` / `inputSchema` (parameter descriptions) / `outputSchema` (Returns fields); supports both the Chinese (default branch) and English (`main-en` branch) docstrings of `dme-python-sdk`
-- **Blacklist**: modeled after `cli.py`; `~/.config/pydme/blacklist.json` takes precedence, high-risk operations are rejected by default (`--accept-risk` / `DME_ACCEPT_RISK=true` to allow)
+- **Blacklist**: modeled after `cli.py`; `~/.config/pydme/blacklist.json` takes precedence. Every blacklisted tool gets an extra optional `accept_risk` parameter (default from `--accept-risk` / `DME_ACCEPT_RISK`); calling it without `accept_risk=true` is rejected with a `RISK_BLOCKED` response telling the caller to set it explicitly
 
 ## Installation
 
@@ -78,6 +78,6 @@ Use the returned `mcp_server_path` values as the client URL to connect to the co
 | `--token` | `DME_API_AUTH_TOKEN` | Auth token (optional; skips login when provided) |
 | `--timeout` | — | Request timeout (default 90) |
 | `--no-cache-auth-token` | — | Disable token caching |
-| `--accept-risk` | `DME_ACCEPT_RISK` | Allow blacklisted high-risk operations |
+| `--accept-risk` | `DME_ACCEPT_RISK` | Default `accept_risk=true` for blacklisted high-risk tools (clients can still override per call) |
 | `--mcp-server` | `DME_MCP_SERVER` | Listen address `host:port` (default: `127.0.0.1:8000`) |
 | `--mcp-transport` | — | `streamable-http` (default) / `stdio` |

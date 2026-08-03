@@ -111,7 +111,8 @@ Examples:
 
     # Risk control (mirrors cli.py --accept-risk)
     parser.add_argument('--accept-risk', action='store_true',
-                        help='acknowledge and accept risk, allowing blacklisted high-risk operations')
+                        help='accept risk by default: blacklisted high-risk tools default '
+                             'accept_risk=true (clients may still override it per call)')
 
     return parser
 
@@ -206,11 +207,15 @@ def _is_json_schema_type(ann: Any) -> bool:
 
 
 def make_wrapper(func, client, topic, action_key, parsed, output_model, risky, args):
-    """Build the wrapper function for an MCP tool.
+    """Build the wrapper function for an MCP tool (decorator over the SDK action).
 
     - Drops the ``client`` parameter and injects the instantiated DMEAPIClient via closure
     - Parameter descriptions come from docstring parsing (``Annotated[type, Field(description=...)]``)
-    - Blacklist guard: blacklisted and risk not accepted -> structured error
+    - Blacklist guard: risky tools get an extra optional ``accept_risk`` parameter whose
+      default comes from the server CLI (``--accept-risk`` / ``DME_ACCEPT_RISK``). When a
+      blacklisted tool is called with ``accept_risk=false`` (or unset with a false default),
+      the call is rejected with a structured error telling the caller to set
+      ``accept_risk=true`` explicitly.
     - Structured output: returns a dynamic model (extra='allow' tolerates real return differences)
     """
     sig = inspect.signature(func)
@@ -226,13 +231,29 @@ def make_wrapper(func, client, topic, action_key, parsed, output_model, risky, a
             ann = Annotated[ann, Field(description=pdesc)]
         new_params.append(p.replace(annotation=ann))
 
+    # Blacklist decorator: inject an optional accept_risk parameter on risky tools only.
+    default_accept = accept_risk_enabled(args) if risky else None
+    if risky:
+        new_params.append(inspect.Parameter(
+            'accept_risk',
+            inspect.Parameter.KEYWORD_ONLY,
+            default=default_accept,
+            annotation=Annotated[bool, Field(
+                description='explicitly set to true to allow this high-risk operation '
+                            f'(defaults to {"true" if default_accept else "false"} from the '
+                            'server --accept-risk / DME_ACCEPT_RISK setting)',
+            )],
+        ))
+
     def wrapper(**kwargs):
-        if risky and not accept_risk_enabled(args):
-            return {
-                'error': f'high-risk operation rejected: {topic} {action_key}'
-                         f' (allow with --accept-risk or DME_ACCEPT_RISK=true)',
-                'code': 'RISK_BLOCKED',
-            }
+        if risky:
+            accept = kwargs.pop('accept_risk', default_accept)
+            if not accept:
+                return {
+                    'error': f'high-risk operation rejected: {topic} {action_key}; '
+                             'set accept_risk=true to allow this operation',
+                    'code': 'RISK_BLOCKED',
+                }
         result = func(client, **kwargs)
         if output_model is not None and isinstance(result, dict):
             return output_model(**result)
