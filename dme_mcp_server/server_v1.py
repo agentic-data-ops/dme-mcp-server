@@ -24,7 +24,7 @@ from typing import Annotated, Any, Dict, List, Optional, get_origin
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
-from pydantic import Field
+from pydantic import Field, RootModel
 
 from pydme.client import DMEAPIClient
 
@@ -33,6 +33,7 @@ from dme_mcp_server.docstring_parser import (
     build_output_model,
     parse_docstring,
     parse_returns_fields,
+    returns_is_array,
 )
 
 
@@ -222,8 +223,14 @@ def make_wrapper(func, client, topic, action_key, parsed, output_model, risky, a
                     'code': 'RISK_BLOCKED',
                 }
         result = func(client, **kwargs)
-        if output_model is not None and isinstance(result, dict):
-            return output_model(**result)
+        if output_model is not None:
+            if issubclass(output_model, RootModel):
+                # Array-style Returns ([{...}, ...]): outputSchema comes from the
+                # RootModel (top-level 'type: array'). Return the raw list as-is;
+                # FastMCP validates it against the RootModel during result conversion.
+                return result
+            if isinstance(result, dict):
+                return output_model(**result)
         return result
 
     wrapper.__signature__ = sig.replace(
@@ -242,7 +249,10 @@ def register_action(mcp, topic, action_key, info, client, blacklist, args):
     subtopic = info.get('subtopic')
     action = strip_subtopic_prefix(action_key, subtopic)
     parsed = parse_docstring(inspect.getdoc(func) or '')
-    output_model = build_output_model(parse_returns_fields(parsed['returns']))
+    output_model = build_output_model(
+        parse_returns_fields(parsed['returns']),
+        is_array=returns_is_array(parsed['returns']),
+    )
     risky = is_risky(blacklist, topic, action_key)
 
     wrapper = make_wrapper(func, client, topic, action_key, parsed, output_model, risky, args)

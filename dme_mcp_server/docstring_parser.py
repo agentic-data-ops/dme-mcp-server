@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-from pydantic import BaseModel, ConfigDict, Field, create_model
+from pydantic import BaseModel, ConfigDict, Field, RootModel, create_model
 
 # docstring return type hints -> JSON Schema types
 _TYPE_MAP = {
@@ -149,6 +149,20 @@ def parse_docstring(doc: str) -> Dict[str, Any]:
     return result
 
 
+def returns_is_array(returns_text: str) -> bool:
+    """Whether the Returns block is an array literal (first non-empty line starts with '[').
+
+    Matches SDK array-style Returns like ``[{...}, ...]`` (e.g. ``task_show``); object-style
+    Returns like ``{...}`` (e.g. ``task_list``) return False.
+    """
+    for raw in returns_text.split('\n'):
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        return stripped.startswith('[')
+    return False
+
+
 def parse_returns_fields(returns_text: str) -> List[Tuple[str, str, str]]:
     """Heuristically parse the Returns top-level fields -> ``[(name, type_hint, desc)]``.
 
@@ -193,24 +207,35 @@ def parse_returns_fields(returns_text: str) -> List[Tuple[str, str, str]]:
 
 
 def _schema_type(type_hint: str) -> Dict[str, Any]:
-    """Map a type hint to a JSON Schema type fragment."""
+    """Map a type hint to a JSON Schema type fragment.
+
+    The hint is truncated at the first comma so trailing annotations like
+    ``'integer, UTC milliseconds'`` or ``'string, nullable'`` map to their base
+    type instead of falling through to an untyped ``str`` field.
+    """
     hint = type_hint.strip()
     if not hint:
         return {}
-    if hint.startswith('List<') or hint.startswith('list<'):
-        item_hint = hint[5:-1].strip()
+    base = hint.split(',')[0].strip()
+    if base.startswith('List<') or base.startswith('list<'):
+        item_hint = base[5:-1].strip()
         item_type = _TYPE_MAP.get(item_hint.lower())
         return {'type': 'array', 'items': {'type': item_type} if item_type else {}}
-    t = _TYPE_MAP.get(hint.lower())
+    t = _TYPE_MAP.get(base.lower())
     return {'type': t} if t else {}
 
 
-def build_output_model(fields: List[Tuple[str, str, str]]) -> Optional[type[BaseModel]]:
+def build_output_model(fields: List[Tuple[str, str, str]], is_array: bool = False) -> Any:
     """Build a lenient pydantic model from the Returns top-level fields (for outputSchema).
 
     - All fields are Optional with default None (tolerates missing fields in real returns)
     - ``extra='allow'`` (tolerates extra fields in real returns)
     - Returns None when ``fields`` is empty (caller falls back to unstructured output)
+    - Returns a dynamic ``RootModel[List[element_model]]`` subclass when ``is_array=True``
+      (array-style Returns like ``[{...}, ...]``), so FastMCP reports an ``array``
+      outputSchema whose ``items`` carries the element schema (a bare ``List[model]``
+      annotation would instead be wrapped by FastMCP into ``{'result': [...]}``);
+      otherwise returns the plain ``element_model`` (object)
     """
     if not fields:
         return None
@@ -223,8 +248,13 @@ def build_output_model(fields: List[Tuple[str, str, str]]) -> Optional[type[Base
             py_type = list
         model_fields[name] = (Optional[py_type], Field(None, description=desc or type_hint or name))
 
-    return create_model(
+    element_model = create_model(
         'ActionOutput',
         __config__=ConfigDict(extra='allow'),
         **model_fields,
     )
+    if is_array:
+        # RootModel subclass (a BaseModel) so FastMCP uses it directly and its schema
+        # top-level is 'array' (bare List[model] would be wrapped in {'result': ...}).
+        return type('ActionOutputList', (RootModel[List[element_model]],), {})
+    return element_model
