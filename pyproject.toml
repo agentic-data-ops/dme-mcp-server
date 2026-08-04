@@ -12,9 +12,6 @@ license = { text = "MIT" }
 
 dependencies = [
     "mcp>=1.28,<2",
-    # dme-python-sdk repo (https://github.com/agentic-data-ops/dme-python-sdk.git)
-    # the installed package is named pydme, so the dependency name is pydme
-    "pydme @ git+https://github.com/agentic-data-ops/dme-python-sdk.git",
 ]
 
 [project.scripts]
