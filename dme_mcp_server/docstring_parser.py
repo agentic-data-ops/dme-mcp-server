@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import re
 
-from pydantic import BaseModel, ConfigDict, Field, RootModel, create_model
+from pydantic import BaseModel, ConfigDict, Field, create_model
 
 # docstring return type hints -> JSON Schema types
 _TYPE_MAP = {
@@ -231,11 +231,12 @@ def build_output_model(fields: List[Tuple[str, str, str]], is_array: bool = Fals
     - All fields are Optional with default None (tolerates missing fields in real returns)
     - ``extra='allow'`` (tolerates extra fields in real returns)
     - Returns None when ``fields`` is empty (caller falls back to unstructured output)
-    - Returns a dynamic ``RootModel[List[element_model]]`` subclass when ``is_array=True``
-      (array-style Returns like ``[{...}, ...]``), so FastMCP reports an ``array``
-      outputSchema whose ``items`` carries the element schema (a bare ``List[model]``
-      annotation would instead be wrapped by FastMCP into ``{'result': [...]}``);
-      otherwise returns the plain ``element_model`` (object)
+    - Returns ``List[element_model]`` when ``is_array=True`` (array-style Returns like
+      ``[{...}, ...]``). MCP V1 requires ``CallToolResult.structuredContent`` to be a JSON
+      object, so FastMCP wraps array-typed returns into ``{'result': [...]}`` and reports
+      an object outputSchema whose ``properties.result`` carries the array schema
+      (top-level ``type: array`` is not protocol-compliant); otherwise returns the plain
+      ``element_model`` (object)
     """
     if not fields:
         return None
@@ -254,7 +255,7 @@ def build_output_model(fields: List[Tuple[str, str, str]], is_array: bool = Fals
         **model_fields,
     )
     if is_array:
-        # RootModel subclass (a BaseModel) so FastMCP uses it directly and its schema
-        # top-level is 'array' (bare List[model] would be wrapped in {'result': ...}).
-        return type('ActionOutputList', (RootModel[List[element_model]],), {})
+        # FastMCP wraps List[model] returns into {'result': [...]} (MCP V1 requires
+        # structuredContent to be a JSON object, so a top-level array is not allowed).
+        return List[element_model]
     return element_model

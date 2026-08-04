@@ -24,7 +24,7 @@ from typing import Annotated, Any, Dict, List, Optional, get_origin
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
-from pydantic import Field, RootModel
+from pydantic import Field
 
 from pydme.client import DMEAPIClient
 
@@ -224,10 +224,10 @@ def make_wrapper(func, client, topic, action_key, parsed, output_model, risky, a
                 }
         result = func(client, **kwargs)
         if output_model is not None:
-            if issubclass(output_model, RootModel):
-                # Array-style Returns ([{...}, ...]): outputSchema comes from the
-                # RootModel (top-level 'type: array'). Return the raw list as-is;
-                # FastMCP validates it against the RootModel during result conversion.
+            if get_origin(output_model) is list:
+                # Array-style Returns ([{...}, ...]): outputSchema is List[element_model]
+                # and FastMCP wraps the raw list into {'result': [...]} during result
+                # conversion (MCP V1 requires structuredContent to be a JSON object).
                 return result
             if isinstance(result, dict):
                 return output_model(**result)
