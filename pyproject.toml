@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.scripts]
-dme-mcp-server = "dme_mcp_server.server:main"
+dme-mcp-server = "dme_mcp_server.server_v1:main"
 
 [tool.setuptools.packages.find]
 include = ["dme_mcp_server*"]

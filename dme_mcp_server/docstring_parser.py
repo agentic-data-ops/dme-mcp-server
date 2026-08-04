@@ -4,7 +4,7 @@ Rewritten from the ``parse_docstring`` rules in ``pydme/cli.py`` (without import
 and converts the parse result into the three elements of an MCP tool:
 
 - ``description``   <- function description before Args (clean text)
-- ``inputSchema``   <- Args parameter descriptions (injected by server.py as ``Annotated[type, Field(description=...)]``)
+- ``inputSchema``   <- Args parameter descriptions (injected by server_v1.py as ``Annotated[type, Field(description=...)]``)
 - ``outputSchema``  <- heuristic parse of Returns top-level fields -> dynamic pydantic model (``structured_output``)
 """
 

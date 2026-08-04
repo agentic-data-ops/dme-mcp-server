@@ -5,10 +5,9 @@ MCP Server for DME storage O&M
 Exposes 16 action modules (427 actions) from `dme-python-sdk` as MCP V1 tools
 
 - **MCP V1** (`mcp>=1.28,<2`, FastMCP)
-- **Endpoints**: one shared endpoint, one path per module, format `<endpoint>/mcp/v1/<module>` (e.g. `http://127.0.0.1:8000/mcp/v1/san`)
-- **Root MCP Server**: `/mcp/v1` exposes a `list_tools` tool that enumerates every module endpoint and its tools (see [Root MCP Server](#root-mcp-server))
+- **Endpoint**: a single root MCP Server at `<endpoint>/mcp/v1` (e.g. `http://127.0.0.1:8000/mcp/v1`) — all module tools are registered on this one server, no per-module mounts
 - **Tool naming**: dot-separated `<topic>.<action_key>` (e.g. `san.lun.list`)
-- **Annotation**: every tool carries `meta = {"topic", "subtopic", "action"}`
+- **Annotation**: every tool carries `annotations.topic = <module>` (e.g. `san`), plus `meta = {"topic", "subtopic", "action"}`
 - **Docstring parsing**: action function docstrings are parsed into the tool's `description` / `inputSchema` (parameter descriptions) / `outputSchema` (Returns fields); supports both the Chinese (default branch) and English (`main-en` branch) docstrings of `dme-python-sdk`
 - **Blacklist**: modeled after `cli.py`; `~/.config/pydme/blacklist.json` takes precedence. Every blacklisted tool gets an extra optional `accept_risk` parameter (default from `--accept-risk` / `DME_ACCEPT_RISK`); calling it without `accept_risk=true` is rejected with a `RISK_BLOCKED` response telling the caller to set it explicitly
 
@@ -46,27 +45,11 @@ dme-mcp-server --mcp-server x --mcp-transport stdio \
 
 ## Connecting
 
-Each module is an independent MCP server. Point your MCP client at one of these URLs:
+All module tools live on a single root MCP server. Point your MCP client at:
 
-- Per module: `http://<host>:<port>/mcp/v1/<module>` — e.g. `http://127.0.0.1:8000/mcp/v1/san`, `/mcp/v1/nas`, `/mcp/v1/storage`
-- Root: `http://<host>:<port>/mcp/v1` — root server, exposes only the `list_tools` tool
+- `http://<host>:<port>/mcp/v1` — e.g. `http://127.0.0.1:8000/mcp/v1`
 
-### Root MCP Server
-
-Call the `list_tools` tool on the root server to enumerate every module endpoint and its tools:
-
-```
-tools/call  {"name": "list_tools", "arguments": {}}
-```
-
-Response (JSON text):
-
-```json
-[{"mcp_server_path": "http://<host>:<port>/mcp/v1/<module>",
-  "tools": [{"name": "<tool_name>", "description": "<tool_description>"}]}]
-```
-
-Use the returned `mcp_server_path` values as the client URL to connect to the corresponding module server.
+`tools/list` returns every action from all modules; each tool is named `<topic>.<action_key>`, so clients can group/filter by module on the `<topic>` prefix. Every tool also carries `annotations.topic = <module>` (a non-standard extension field, for reference).
 
 ## Options
 
