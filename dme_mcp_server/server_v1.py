@@ -6,7 +6,7 @@ Dynamically exposes the action functions of the 16 action modules from ``dme-pyt
 - Endpoint: a single root MCP Server at ``<endpoint>/mcp/v1`` exposing every module's action tools
   (no per-module mounts)
 - Tool naming: dot-separated ``<topic>.<action_key>`` (SEP-986 allows ``.``)
-- Annotation: every tool carries ``annotations.topic = <module>`` (plus ``meta = {"topic", "subtopic", "action"}``)
+- Annotation: every tool carries ``annotations.topic/subtopic/action`` (extension fields; no ``_meta``)
 - Docstring parsing: standalone parser for action function docstrings ->
   ``description`` / ``inputSchema`` (parameter descriptions) / ``outputSchema`` (Returns fields)
 - Blacklist: mirrors ``pydme/cli.py``; blacklisted high-risk operations are rejected by default
@@ -252,8 +252,11 @@ def register_action(mcp, topic, action_key, info, client, blacklist, args):
         wrapper,
         name=tool_name,
         description=parsed['description'] or info.get('description', ''),
-        annotations=ToolAnnotations(topic=topic),
-        meta={'topic': topic, 'subtopic': subtopic or '', 'action': action},
+        annotations=ToolAnnotations(
+            topic=topic,
+            subtopic=subtopic or '',
+            action=action,
+        ),
         structured_output=output_model is not None,
     )
 
