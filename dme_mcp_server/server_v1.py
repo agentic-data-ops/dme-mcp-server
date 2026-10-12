@@ -20,9 +20,10 @@ list too long for LLM context):
   docstring when a resource entry is missing
 - The action registry comes from ``pydme.i18n.load_actions_registry`` (func
   names resolved to callables, mirroring the new cli.py)
-- Blacklist: mirrors ``pydme/cli.py``; blacklisted high-risk operations are
-  rejected by default (``--accept-risk`` / ``DME_ACCEPT_RISK`` or the per-call
-  ``accept_risk=true`` argument to allow)
+- Blacklist: uses ``pydme.cli.load_blacklist`` (``~/.config/pydme/blacklist.json`` takes
+  precedence over the SDK default, same policy as the pydme CLI); blacklisted high-risk
+  operations are rejected by default (``--accept-risk`` / ``DME_ACCEPT_RISK`` or the
+  per-call ``accept_risk=true`` argument to allow)
 """
 
 import argparse
@@ -37,10 +38,8 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from pydme.client import DMEAPIClient
-from pydme.cli import DMECLI
+from pydme.cli import DMECLI, load_blacklist
 from pydme.i18n import get_action_doc, load_actions, load_actions_registry, resolve_lang
-
-from dme_mcp_server.blacklist import accept_risk_enabled, is_risky, load_blacklist
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +119,13 @@ class _State:
         self.blacklist = blacklist
         self.args = args
         self.lang = lang
+
+
+def _risk_accepted(args) -> bool:
+    """Whether risk has been accepted: ``--accept-risk`` or ``DME_ACCEPT_RISK=true/1/yes``
+    (mirrors ``pydme.cli._accepts_risk``)."""
+    return (getattr(args, 'accept_risk', False)
+            or os.environ.get('DME_ACCEPT_RISK', '').lower() in ('true', '1', 'yes'))
 
 
 def _resolve_action_key(state: _State, topic: str, action: str, subtopic: Optional[str]) -> str:
@@ -218,9 +224,11 @@ def _exec_action(state: _State, topic: str, action: str, params: Optional[Dict[s
     registry = load_actions_registry(state.lang)
     key = _resolve_action_key(state, topic, action, subtopic)
     entry = registry[topic][key]
-    if is_risky(state.blacklist, topic, key):
+    # risk check: the blacklist comes from pydme.cli.load_blacklist
+    # (user ~/.config/pydme/blacklist.json takes precedence over the SDK default)
+    if key in state.blacklist.get(topic, []):
         if accept_risk is None:
-            accept_risk = accept_risk_enabled(state.args)
+            accept_risk = _risk_accepted(state.args)
         if not accept_risk:
             return {
                 'error': f'high-risk operation rejected: {topic} {key}; '
@@ -314,7 +322,7 @@ def _register_tools(mcp: FastMCP, state: _State) -> None:
 
 def run_mcp_server(args, client):
     """Build and run the MCP server with the 4 meta tools."""
-    blacklist = load_blacklist()
+    blacklist = load_blacklist()  # pydme.cli.load_blacklist (mirrors the pydme CLI risk policy)
     # Action help language: --lang > DME_CLI_LANG > zh_CN (mirrors cli.py)
     lang = resolve_lang(args.lang)
     state = _State(client, blacklist, args, lang)
