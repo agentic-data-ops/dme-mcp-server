@@ -1,28 +1,35 @@
 #!/usr/bin/env python
 """DME MCP Server (MCP V1).
 
-Dynamically exposes the action functions of the 16 action modules from ``dme-python-sdk`` as MCP tools:
+Exposes a fixed set of 4 meta tools over the dme-python-sdk action library
+(instead of registering every action as its own MCP tool, which made the tool
+list too long for LLM context):
 
-- Endpoint: a single root MCP Server at ``<endpoint>/mcp/v1`` exposing every module's action tools
-  (no per-module mounts)
-- Tool naming: dot-separated ``<topic>.<action_key>`` (SEP-986 allows ``.``)
-- Annotation: every tool carries ``annotations.topic/subtopic/action`` (extension fields; no ``_meta``)
-- Docstring parsing: action help text comes from ``dme-python-sdk``'s standalone
-  i18n resources (``pydme/config/i18n/<lang>.yaml``, selected by ``--lang`` /
-  ``DME_CLI_LANG``, default zh_CN), falling back to the function docstring when
-  a resource entry is missing; parsed into ``description`` / ``inputSchema``
-  (parameter descriptions) / ``outputSchema`` (Returns fields)
-- Blacklist: mirrors ``pydme/cli.py``; blacklisted high-risk operations are rejected by default
-  (``--accept-risk`` / ``DME_ACCEPT_RISK`` to allow)
+  list_topics       -- all topics and subtopics with descriptions
+                       (same as ``pydme --list-topics``)
+  list_actions      -- actions of a topic / one subtopic with descriptions
+                       (same as ``pydme <topic> [<subtopic>] --help``)
+  show_action_help  -- description / parameters / output of one action
+                       (same as ``pydme <topic> [<subtopic>] <action> --help``)
+  exec_action       -- execute one action with a parameter dict
+                       (same as ``pydme <topic> [<subtopic>] <action> --param value ...``)
+
+- Help text comes from dme-python-sdk i18n resources
+  (``pydme/config/i18n/actions_<lang>.yaml`` + ``funcs_<lang>.yaml``, selected by
+  ``--lang`` / ``DME_CLI_LANG``, default zh_CN), falling back to the function
+  docstring when a resource entry is missing
+- The action registry comes from ``pydme.i18n.load_actions_registry`` (func
+  names resolved to callables, mirroring the new cli.py)
+- Blacklist: mirrors ``pydme/cli.py``; blacklisted high-risk operations are
+  rejected by default (``--accept-risk`` / ``DME_ACCEPT_RISK`` or the per-call
+  ``accept_risk=true`` argument to allow)
 """
 
 import argparse
-import importlib
 import inspect
 import os
-import pkgutil
 import sys
-from typing import Annotated, Any, Dict, List, Optional, get_origin
+from typing import Annotated, Any, Dict, List, Optional
 
 import uvicorn
 from mcp.server.fastmcp import FastMCP
@@ -30,15 +37,10 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from pydme.client import DMEAPIClient
-from pydme.i18n import get_action_doc, resolve_lang
+from pydme.i18n import get_action_doc, load_actions, load_actions_registry, resolve_lang
 
 from dme_mcp_server.blacklist import accept_risk_enabled, is_risky, load_blacklist
-from dme_mcp_server.docstring_parser import (
-    build_output_model,
-    parse_docstring,
-    parse_returns_fields,
-    returns_is_array,
-)
+from dme_mcp_server.docstring_parser import parse_docstring
 
 
 # ---------------------------------------------------------------------------
@@ -49,14 +51,15 @@ def create_parser() -> argparse.ArgumentParser:
     """Create the command-line parser."""
     parser = argparse.ArgumentParser(
         prog='dme-mcp-server',
-        description='DME MCP Server - exposes dme-python-sdk actions as MCP V1 tools',
+        description='DME MCP Server - exposes dme-python-sdk actions via 4 meta tools',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''\
 Examples:
   dme-mcp-server --mcp-server 0.0.0.0:8000 \\
       --endpoint https://192.168.1.100:26335 --user admin --password xxx
   # Environment variables: DME_MCP_SERVER / DME_API_ENDPOINT / DME_API_USERNAME / DME_API_PASSWORD
-  # Endpoint: http://<host>:<port>/mcp/v1''',
+  # Endpoint: http://<host>:<port>/mcp/v1
+  # Tools: list_topics / list_actions / show_action_help / exec_action''',
     )
 
     # DME connection params (mirror cli.py; environment variables supported)
@@ -88,8 +91,8 @@ Examples:
 
     # Risk control (mirrors cli.py --accept-risk)
     parser.add_argument('--accept-risk', action='store_true',
-                        help='accept risk by default: blacklisted high-risk tools default '
-                             'accept_risk=true (clients may still override it per call)')
+                        help='accept risk by default: blacklisted high-risk operations are '
+                             'allowed unless exec_action passes accept_risk=false')
 
     return parser
 
@@ -106,205 +109,201 @@ def parse_host_port(server: str) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# Action module discovery and action collection (mirror cli.py's get_available_topics / get_topic_actions)
+# Tool state and implementations (mirror cli.py behavior)
 # ---------------------------------------------------------------------------
 
-def discover_topics() -> List[str]:
-    """Scan the pydme.actions package directory and return all topic module names."""
-    import pydme.actions as actions_pkg
-    path = os.path.dirname(actions_pkg.__file__)
-    return sorted(m for _, m, _ in pkgutil.iter_modules([path]) if not m.startswith('_'))
+class _State:
+    """Runtime state shared by the meta tools (client, blacklist, args, lang)."""
+
+    def __init__(self, client, blacklist, args, lang):
+        self.client = client
+        self.blacklist = blacklist
+        self.args = args
+        self.lang = lang
 
 
-def get_topic_actions(topic: str) -> Dict[str, Dict]:
-    """Collect all actions of a topic module -> {action_key: {func, subtopic, description}}.
+def _resolve_action_key(state: _State, topic: str, action: str, subtopic: Optional[str]) -> str:
+    """Resolve and validate (topic, subtopic, action) -> the full action key.
 
-    Handles subtopic declarations in ACTIONS (``module`` field expansion, mirroring cli.py).
+    - ``subtopic`` given: full key is ``<subtopic>_<action>``
+    - ``subtopic`` omitted: only direct (two-level) actions are accepted
     """
-    try:
-        module = importlib.import_module(f'pydme.actions.{topic}')
-    except ImportError:
-        return {}
-
-    actions = {}
-    for action_key, action_data in getattr(module, 'ACTIONS', {}).items():
-        func = action_data.get('func')
-        if func is None and 'module' in action_data:
-            # Subtopic declaration: expand actions from the submodule
-            subtopic = action_data.get('subtopic')
-            try:
-                sub_module = importlib.import_module(action_data['module'])
-                for sub_key, sub_data in getattr(sub_module, 'ACTIONS', {}).items():
-                    if sub_data.get('subtopic') in (subtopic, action_key) and sub_data.get('func'):
-                        actions[sub_key] = {
-                            'func': sub_data['func'],
-                            'subtopic': subtopic,
-                            'description': sub_data.get('description', ''),
-                        }
-            except ImportError:
-                pass
-            continue
-        if callable(func):
-            actions[action_key] = {
-                'func': func,
-                'subtopic': action_data.get('subtopic'),
-                'description': action_data.get('description', ''),
-            }
-    return actions
-
-
-def strip_subtopic_prefix(action_key: str, subtopic: Optional[str]) -> str:
-    """Strip the subtopic prefix from an action_key (space / underscore separated, mirroring cli.py)."""
+    registry = load_actions_registry(state.lang)
+    if topic not in registry:
+        raise ValueError(f"topic '{topic}' not found")
+    keys = registry[topic]
     if subtopic:
-        for prefix in (f'{subtopic} ', f'{subtopic}_'):
-            if action_key.startswith(prefix):
-                return action_key[len(prefix):]
-    return action_key
+        key = f"{subtopic}_{action}"
+        if key not in keys:
+            raise ValueError(f"action '{topic} {subtopic} {action}' not found")
+        return key
+    entry = keys.get(action)
+    if entry is None or entry['subtopic'] is not None:
+        raise ValueError(f"action '{topic} {action}' not found (a subtopic may be required)")
+    return action
 
 
-# ---------------------------------------------------------------------------
-# Tool registration
-# ---------------------------------------------------------------------------
+def _list_topics(state: _State) -> List[Dict[str, Any]]:
+    """All topics and subtopics with descriptions (same as `pydme --list-topics`)."""
+    tree = load_actions(state.lang)['topics']
+    result = []
+    for topic in sorted(tree):
+        data = tree[topic]
+        result.append({
+            'topic': topic,
+            'description': data['description'],
+            'subtopics': [
+                {'name': st, 'description': sd['description']}
+                for st, sd in sorted(data['subtopics'].items())
+            ],
+        })
+    return result
 
-def _is_json_schema_type(ann: Any) -> bool:
-    """Whether an annotation can safely produce a JSON Schema.
 
-    Some SDK modules (fcswitch / storage) define ``def list(...)`` that shadows builtins.list,
-    binding ``x: list`` annotations to the function object - function annotations make pydantic
-    generate a Callable schema and recurse into its signature (including client: DMEAPIClient),
-    which fails registration. Such annotations fall back to ``Any``.
+def _list_actions(state: _State, topic: str, subtopic: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Actions of a topic or one of its subtopics (same as `pydme <topic> [<subtopic>] --help`).
+
+    Without ``subtopic``: direct actions first, then every subtopic's actions.
     """
-    if ann is Any or ann is inspect.Parameter.empty:
-        return True
-    if get_origin(ann) is not None:  # generics: List/Dict/Optional/Union/Annotated, etc.
-        return True
-    if isinstance(ann, type):
-        return issubclass(ann, (str, int, float, bool, list, dict, tuple, bytes, set, type(None)))
-    return False
+    tree = load_actions(state.lang)['topics']
+    if topic not in tree:
+        raise ValueError(f"topic '{topic}' not found")
+    data = tree[topic]
+    result = []
+    if subtopic:
+        sd = data['subtopics'].get(subtopic)
+        if sd is None:
+            raise ValueError(f"subtopic '{subtopic}' not found in topic '{topic}'")
+        result.extend({'subtopic': subtopic, 'action': a['name'], 'description': a['description']}
+                      for a in sd['actions'])
+    else:
+        result.extend({'subtopic': None, 'action': a['name'], 'description': a['description']}
+                      for a in data['actions'])
+        for st, sd in sorted(data['subtopics'].items()):
+            result.extend({'subtopic': st, 'action': a['name'], 'description': a['description']}
+                          for a in sd['actions'])
+    return result
 
 
-def make_wrapper(func, client, topic, action_key, parsed, output_model, risky, args):
-    """Build the wrapper function for an MCP tool (decorator over the SDK action).
-
-    - Drops the ``client`` parameter and injects the instantiated DMEAPIClient via closure
-    - Parameter descriptions come from docstring parsing (``Annotated[type, Field(description=...)]``)
-    - Blacklist guard: risky tools get an extra optional ``accept_risk`` parameter whose
-      default comes from the server CLI (``--accept-risk`` / ``DME_ACCEPT_RISK``). When a
-      blacklisted tool is called with ``accept_risk=false`` (or unset with a false default),
-      the call is rejected with a structured error telling the caller to set
-      ``accept_risk=true`` explicitly.
-    - Structured output: returns a dynamic model (extra='allow' tolerates real return differences)
-    """
-    sig = inspect.signature(func)
-    new_params = []
-    for name, p in sig.parameters.items():
-        if name == 'client':
-            continue
-        ann = p.annotation if p.annotation is not inspect.Parameter.empty else Any
-        if not _is_json_schema_type(ann):
-            ann = Any
-        pdesc = parsed.get('params', {}).get(name, '')
-        if pdesc:
-            ann = Annotated[ann, Field(description=pdesc)]
-        new_params.append(p.replace(annotation=ann))
-
-    # Blacklist decorator: inject an optional accept_risk parameter on risky tools only.
-    default_accept = accept_risk_enabled(args) if risky else None
-    if risky:
-        new_params.append(inspect.Parameter(
-            'accept_risk',
-            inspect.Parameter.KEYWORD_ONLY,
-            default=default_accept,
-            annotation=Annotated[bool, Field(
-                description='explicitly set to true to allow this high-risk operation '
-                            f'(defaults to {"true" if default_accept else "false"} from the '
-                            'server --accept-risk / DME_ACCEPT_RISK setting)',
-            )],
-        ))
-
-    def wrapper(**kwargs):
-        if risky:
-            accept = kwargs.pop('accept_risk', default_accept)
-            if not accept:
-                return {
-                    'error': f'high-risk operation rejected: {topic} {action_key}; '
-                             'set accept_risk=true to allow this operation',
-                    'code': 'RISK_BLOCKED',
-                }
-        result = func(client, **kwargs)
-        if output_model is not None:
-            if get_origin(output_model) is list:
-                # Array-style Returns ([{...}, ...]): outputSchema is List[element_model]
-                # and FastMCP wraps the raw list into {'result': [...]} during result
-                # conversion (MCP V1 requires structuredContent to be a JSON object).
-                return result
-            if isinstance(result, dict):
-                return output_model(**result)
-        return result
-
-    wrapper.__signature__ = sig.replace(
-        parameters=new_params,
-        return_annotation=output_model if output_model is not None else Any,
-    )
-    wrapper.__annotations__ = {p.name: p.annotation for p in new_params}
-    if output_model is not None:
-        wrapper.__annotations__['return'] = output_model
-    return wrapper
-
-
-def register_action(mcp, topic, action_key, info, client, blacklist, args, lang):
-    """Register a single action as an MCP tool.
-
-    Action help text comes from the ``dme-python-sdk`` i18n resources
-    (``pydme/config/i18n/<lang>.yaml``) keyed by ``(topic, action_key)``,
-    mirroring ``cli.py``'s ``_doc_for``: a missing resource entry falls back to
-    the function docstring (warning when that is empty too).
-    """
-    func = info['func']
-    subtopic = info.get('subtopic')
-    action = strip_subtopic_prefix(action_key, subtopic)
-    doc = get_action_doc(topic, action_key, lang)
-    if doc is None:
+def _show_action_help(state: _State, topic: str, action: str,
+                      subtopic: Optional[str] = None) -> Dict[str, Any]:
+    """Help of one action: description, parameters (without ``client``) and output
+    (same as `pydme <topic> [<subtopic>] <action> --help`)."""
+    registry = load_actions_registry(state.lang)
+    key = _resolve_action_key(state, topic, action, subtopic)
+    doc = get_action_doc(topic, key, state.lang)
+    if doc is None:  # mirror cli.py _doc_for: fall back to the function docstring
+        func = registry[topic][key]['func']
         doc = inspect.getdoc(func) or ''
-        if not doc:
-            print(f'Warning: i18n resource is missing comments for '
-                  f'{lang}.{topic}.{action_key}, please update the corresponding YAML',
-                  file=sys.stderr)
     parsed = parse_docstring(doc)
-    output_model = build_output_model(
-        parse_returns_fields(parsed['returns']),
-        is_array=returns_is_array(parsed['returns']),
-    )
-    risky = is_risky(blacklist, topic, action_key)
+    params = {name: desc for name, desc in parsed['params'].items() if name != 'client'}
+    return {
+        'action': f"{topic} {subtopic} {action}" if subtopic else f"{topic} {action}",
+        'description': parsed['description'],
+        'params': params,
+        'returns': parsed['returns'],
+    }
 
-    wrapper = make_wrapper(func, client, topic, action_key, parsed, output_model, risky, args)
-    tool_name = f'{topic}.{action_key}'
+
+def _exec_action(state: _State, topic: str, action: str, params: Optional[Dict[str, Any]] = None,
+                 subtopic: Optional[str] = None, accept_risk: Optional[bool] = None) -> Any:
+    """Execute one action with a parameter dict (same as
+    `pydme <topic> [<subtopic>] <action> --param value ...`).
+
+    Blacklisted high-risk operations are rejected unless ``accept_risk=true``
+    (or the server was started with --accept-risk / DME_ACCEPT_RISK).
+    """
+    registry = load_actions_registry(state.lang)
+    key = _resolve_action_key(state, topic, action, subtopic)
+    entry = registry[topic][key]
+    if is_risky(state.blacklist, topic, key):
+        if accept_risk is None:
+            accept_risk = accept_risk_enabled(state.args)
+        if not accept_risk:
+            return {
+                'error': f'high-risk operation rejected: {topic} {key}; '
+                         'set accept_risk=true to allow this operation',
+                'code': 'RISK_BLOCKED',
+            }
+    func = entry['func']
+    result = func(state.client, **(params or {}))
+    return result if result is not None else {'result': 'ok'}
+
+
+# ---------------------------------------------------------------------------
+# Tool registration (4 meta tools)
+# ---------------------------------------------------------------------------
+
+def _register_tools(mcp: FastMCP, state: _State) -> None:
+    """Register the 4 meta tools on the MCP server."""
+
+    def list_topics() -> List[Dict[str, Any]]:
+        return _list_topics(state)
 
     mcp.add_tool(
-        wrapper,
-        name=tool_name,
-        description=parsed['description'] or info.get('description', ''),
-        annotations=ToolAnnotations(
-            topic=topic,
-            subtopic=subtopic or '',
-            action=action,
-        ),
-        structured_output=output_model is not None,
+        list_topics,
+        name='list_topics',
+        description='List all topics and subtopics with descriptions '
+                    '(equivalent to `pydme --list-topics`)',
+        annotations=ToolAnnotations(topic='', subtopic='', action='list_topics'),
+        structured_output=True,
     )
 
+    def list_actions(
+        topic: Annotated[str, Field(description='topic name, e.g. storage, san, nas')],
+        subtopic: Annotated[Optional[str], Field(
+            description='subtopic name, optional; if omitted, lists the direct actions '
+                        'and the actions of every subtopic under the topic')] = None,
+    ) -> List[Dict[str, Any]]:
+        return _list_actions(state, topic, subtopic)
 
-def register_topic(mcp, topic, client, blacklist, args, lang):
-    """Register all actions of a topic module (a single failure does not take down the server)."""
-    failed = 0
-    for action_key, info in get_topic_actions(topic).items():
-        try:
-            register_action(mcp, topic, action_key, info, client, blacklist, args, lang)
-        except Exception as e:
-            failed += 1
-            print(f'warning: failed to register {topic}.{action_key}: {type(e).__name__}: {e}',
-                  file=sys.stderr)
-    if failed:
-        print(f'[{topic}] {failed} action(s) failed to register (skipped)', file=sys.stderr)
+    mcp.add_tool(
+        list_actions,
+        name='list_actions',
+        description='List the actions of a topic or one of its subtopics with descriptions '
+                    '(equivalent to `pydme <topic> [<subtopic>] --help`)',
+        annotations=ToolAnnotations(topic='', subtopic='', action='list_actions'),
+        structured_output=True,
+    )
+
+    def show_action_help(
+        topic: Annotated[str, Field(description='topic name, e.g. storage, san, nas')],
+        action: Annotated[str, Field(description='action name, e.g. list, create, delete, show')],
+        subtopic: Annotated[Optional[str], Field(
+            description='subtopic name, optional; required for three-level actions')] = None,
+    ) -> Dict[str, Any]:
+        return _show_action_help(state, topic, action, subtopic)
+
+    mcp.add_tool(
+        show_action_help,
+        name='show_action_help',
+        description='Show the help of one action: description, parameter list and output '
+                    '(equivalent to `pydme <topic> [<subtopic>] <action> --help`)',
+        annotations=ToolAnnotations(topic='', subtopic='', action='show_action_help'),
+        structured_output=True,
+    )
+
+    def exec_action(
+        topic: Annotated[str, Field(description='topic name, e.g. storage, san, nas')],
+        action: Annotated[str, Field(description='action name, e.g. list, create, delete, show')],
+        params: Annotated[Optional[Dict[str, Any]], Field(
+            description='action parameters as a JSON object, e.g. {"limit": 20}')] = None,
+        subtopic: Annotated[Optional[str], Field(
+            description='subtopic name, optional; required for three-level actions')] = None,
+        accept_risk: Annotated[Optional[bool], Field(
+            description='set to true to allow a blacklisted high-risk operation '
+                        '(defaults to the server --accept-risk / DME_ACCEPT_RISK setting)')] = None,
+    ) -> Any:
+        return _exec_action(state, topic, action, params, subtopic, accept_risk)
+
+    mcp.add_tool(
+        exec_action,
+        name='exec_action',
+        description='Execute one action with the given parameters '
+                    '(equivalent to `pydme <topic> [<subtopic>] <action> --param value ...`); '
+                    'high-risk operations are blocked unless accept_risk=true',
+        annotations=ToolAnnotations(topic='', subtopic='', action='exec_action'),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -312,28 +311,25 @@ def register_topic(mcp, topic, client, blacklist, args, lang):
 # ---------------------------------------------------------------------------
 
 def run_mcp_server(args, client):
-    """Build and run the MCP server."""
+    """Build and run the MCP server with the 4 meta tools."""
     blacklist = load_blacklist()
-    topics = discover_topics()
     # Action help language: --lang > DME_CLI_LANG > zh_CN (mirrors cli.py)
     lang = resolve_lang(args.lang)
+    state = _State(client, blacklist, args, lang)
 
     if args.mcp_transport == 'stdio':
-        # stdio: single server, register everything (tool names carry the topic prefix, so they are unique)
         mcp = FastMCP('dme')
-        for topic in topics:
-            register_topic(mcp, topic, client, blacklist, args, lang)
-        print(f'MCP Server (stdio) started, registered {len(topics)} topic(s)', file=sys.stderr)
+        _register_tools(mcp, state)
+        print('MCP Server (stdio) started, 4 meta tools registered '
+              '(list_topics / list_actions / show_action_help / exec_action)', file=sys.stderr)
         mcp.run(transport='stdio')
         return
 
-    # streamable-http: a single root MCP Server at /mcp/v1 exposing every module's
-    # action tools (tool names carry the <topic>.<action_key> prefix, so they are unique).
     host, port = parse_host_port(args.mcp_server)
     mcp = FastMCP('dme', streamable_http_path='/mcp/v1')
-    for topic in topics:
-        register_topic(mcp, topic, client, blacklist, args, lang)
-    print(f'MCP Server started: http://{host}:{port}/mcp/v1  (topics: {", ".join(topics)})',
+    _register_tools(mcp, state)
+    print(f'MCP Server started: http://{host}:{port}/mcp/v1  '
+          f'(meta tools: list_topics, list_actions, show_action_help, exec_action)',
           file=sys.stderr)
     uvicorn.run(mcp.streamable_http_app(), host=host, port=port, log_level='info')
 
