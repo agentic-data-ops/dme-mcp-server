@@ -37,10 +37,10 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from pydme.client import DMEAPIClient
+from pydme.cli import DMECLI
 from pydme.i18n import get_action_doc, load_actions, load_actions_registry, resolve_lang
 
 from dme_mcp_server.blacklist import accept_risk_enabled, is_risky, load_blacklist
-from dme_mcp_server.docstring_parser import parse_docstring
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +195,9 @@ def _show_action_help(state: _State, topic: str, action: str,
     if doc is None:  # mirror cli.py _doc_for: fall back to the function docstring
         func = registry[topic][key]['func']
         doc = inspect.getdoc(func) or ''
-    parsed = parse_docstring(doc)
+    # parse with the SDK's own docstring parser so the output matches
+    # `pydme <topic> [<subtopic>] <action> --help` exactly
+    parsed = DMECLI().parse_docstring(doc)
     params = {name: desc for name, desc in parsed['params'].items() if name != 'client'}
     return {
         'action': f"{topic} {subtopic} {action}" if subtopic else f"{topic} {action}",
