@@ -12,6 +12,7 @@ license = { text = "MIT" }
 
 dependencies = [
     "mcp>=1.28,<2",
+    "dme-python-sdk @ git+https://github.com/agentic-data-ops/dme-python-sdk.git@main",
 ]
 
 [project.scripts]

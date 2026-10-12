@@ -7,8 +7,11 @@ Dynamically exposes the action functions of the 16 action modules from ``dme-pyt
   (no per-module mounts)
 - Tool naming: dot-separated ``<topic>.<action_key>`` (SEP-986 allows ``.``)
 - Annotation: every tool carries ``annotations.topic/subtopic/action`` (extension fields; no ``_meta``)
-- Docstring parsing: standalone parser for action function docstrings ->
-  ``description`` / ``inputSchema`` (parameter descriptions) / ``outputSchema`` (Returns fields)
+- Docstring parsing: action help text comes from ``dme-python-sdk``'s standalone
+  i18n resources (``pydme/config/i18n/<lang>.yaml``, selected by ``--lang`` /
+  ``DME_CLI_LANG``, default zh_CN), falling back to the function docstring when
+  a resource entry is missing; parsed into ``description`` / ``inputSchema``
+  (parameter descriptions) / ``outputSchema`` (Returns fields)
 - Blacklist: mirrors ``pydme/cli.py``; blacklisted high-risk operations are rejected by default
   (``--accept-risk`` / ``DME_ACCEPT_RISK`` to allow)
 """
@@ -27,6 +30,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from pydme.client import DMEAPIClient
+from pydme.i18n import get_action_doc, resolve_lang
 
 from dme_mcp_server.blacklist import accept_risk_enabled, is_risky, load_blacklist
 from dme_mcp_server.docstring_parser import (
@@ -76,6 +80,11 @@ Examples:
     parser.add_argument('--mcp-transport', choices=['streamable-http', 'stdio'],
                         default='streamable-http',
                         help='MCP transport (default: streamable-http)')
+
+    # Comment language (mirrors cli.py --lang; resolves via pydme.i18n.resolve_lang)
+    parser.add_argument('--lang', choices=['zh_CN', 'en_US'], default=None,
+                        help='action help language: zh_CN (default) or en_US; can also be '
+                             'set via the DME_CLI_LANG environment variable')
 
     # Risk control (mirrors cli.py --accept-risk)
     parser.add_argument('--accept-risk', action='store_true',
@@ -243,12 +252,25 @@ def make_wrapper(func, client, topic, action_key, parsed, output_model, risky, a
     return wrapper
 
 
-def register_action(mcp, topic, action_key, info, client, blacklist, args):
-    """Register a single action as an MCP tool."""
+def register_action(mcp, topic, action_key, info, client, blacklist, args, lang):
+    """Register a single action as an MCP tool.
+
+    Action help text comes from the ``dme-python-sdk`` i18n resources
+    (``pydme/config/i18n/<lang>.yaml``) keyed by ``(topic, action_key)``,
+    mirroring ``cli.py``'s ``_doc_for``: a missing resource entry falls back to
+    the function docstring (warning when that is empty too).
+    """
     func = info['func']
     subtopic = info.get('subtopic')
     action = strip_subtopic_prefix(action_key, subtopic)
-    parsed = parse_docstring(inspect.getdoc(func) or '')
+    doc = get_action_doc(topic, action_key, lang)
+    if doc is None:
+        doc = inspect.getdoc(func) or ''
+        if not doc:
+            print(f'Warning: i18n resource is missing comments for '
+                  f'{lang}.{topic}.{action_key}, please update the corresponding YAML',
+                  file=sys.stderr)
+    parsed = parse_docstring(doc)
     output_model = build_output_model(
         parse_returns_fields(parsed['returns']),
         is_array=returns_is_array(parsed['returns']),
@@ -271,12 +293,12 @@ def register_action(mcp, topic, action_key, info, client, blacklist, args):
     )
 
 
-def register_topic(mcp, topic, client, blacklist, args):
+def register_topic(mcp, topic, client, blacklist, args, lang):
     """Register all actions of a topic module (a single failure does not take down the server)."""
     failed = 0
     for action_key, info in get_topic_actions(topic).items():
         try:
-            register_action(mcp, topic, action_key, info, client, blacklist, args)
+            register_action(mcp, topic, action_key, info, client, blacklist, args, lang)
         except Exception as e:
             failed += 1
             print(f'warning: failed to register {topic}.{action_key}: {type(e).__name__}: {e}',
@@ -293,12 +315,14 @@ def run_mcp_server(args, client):
     """Build and run the MCP server."""
     blacklist = load_blacklist()
     topics = discover_topics()
+    # Action help language: --lang > DME_CLI_LANG > zh_CN (mirrors cli.py)
+    lang = resolve_lang(args.lang)
 
     if args.mcp_transport == 'stdio':
         # stdio: single server, register everything (tool names carry the topic prefix, so they are unique)
         mcp = FastMCP('dme')
         for topic in topics:
-            register_topic(mcp, topic, client, blacklist, args)
+            register_topic(mcp, topic, client, blacklist, args, lang)
         print(f'MCP Server (stdio) started, registered {len(topics)} topic(s)', file=sys.stderr)
         mcp.run(transport='stdio')
         return
@@ -308,7 +332,7 @@ def run_mcp_server(args, client):
     host, port = parse_host_port(args.mcp_server)
     mcp = FastMCP('dme', streamable_http_path='/mcp/v1')
     for topic in topics:
-        register_topic(mcp, topic, client, blacklist, args)
+        register_topic(mcp, topic, client, blacklist, args, lang)
     print(f'MCP Server started: http://{host}:{port}/mcp/v1  (topics: {", ".join(topics)})',
           file=sys.stderr)
     uvicorn.run(mcp.streamable_http_app(), host=host, port=port, log_level='info')

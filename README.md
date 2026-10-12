@@ -8,19 +8,15 @@ Exposes 16 action modules (427 actions) from `dme-python-sdk` as MCP V1 tools
 - **Endpoint**: a single root MCP Server at `<endpoint>/mcp/v1` (e.g. `http://127.0.0.1:8000/mcp/v1`) — all module tools are registered on this one server, no per-module mounts
 - **Tool naming**: dot-separated `<topic>.<action_key>` (e.g. `san.lun_list`)
 - **Annotation**: every tool carries `annotations.topic` (e.g. `san`), `annotations.subtopic` (e.g. `lun`) and `annotations.action` (e.g. `list`) — extension fields
-- **Docstring parsing**: action function docstrings are parsed into the tool's `description` / `inputSchema` (parameter descriptions) / `outputSchema` (Returns fields); supports both the Chinese (default branch) and English (`main-en` branch) docstrings of `dme-python-sdk`
+- **Docstring parsing**: action help text is loaded from `dme-python-sdk`'s standalone i18n resources (`pydme/config/i18n/<lang>.yaml`, language via `--lang` / `DME_CLI_LANG`, default zh_CN), falling back to the function docstring when a resource entry is missing; parsed into the tool's `description` / `inputSchema` (parameter descriptions) / `outputSchema` (Returns fields)
 - **Blacklist**: modeled after `cli.py`; `~/.config/pydme/blacklist.json` takes precedence. Every blacklisted tool gets an extra optional `accept_risk` parameter (default from `--accept-risk` / `DME_ACCEPT_RISK`); calling it without `accept_risk=true` is rejected with a `RISK_BLOCKED` response telling the caller to set it explicitly
 
 ## Installation
 
+`dme-python-sdk` is declared as a git dependency (the default `main` branch, which carries the
+i18n action-help resources) and is installed automatically — no separate SDK install needed:
+
 ```bash
-# Install dependency (Chinese)
-pip install git+https://github.com/agentic-data-ops/dme-python-sdk.git
-
-# Or install dependency (English)
-pip install git+https://github.com/agentic-data-ops/dme-python-sdk.git@main-en
-
-# Install the MCP Server
 pip install git+https://github.com/agentic-data-ops/dme-mcp-server.git
 ```
 
@@ -62,5 +58,6 @@ All module tools live on a single root MCP server. Point your MCP client at:
 | `--timeout` | — | Request timeout (default 90) |
 | `--no-cache-auth-token` | — | Disable token caching |
 | `--accept-risk` | `DME_ACCEPT_RISK` | Default `accept_risk=true` for blacklisted high-risk tools (clients can still override per call) |
+| `--lang` | `DME_CLI_LANG` | Action help language: `zh_CN` (default) / `en_US` (mirrors pydme CLI) |
 | `--mcp-server` | `DME_MCP_SERVER` | Listen address `host:port` (default: `127.0.0.1:8000`) |
 | `--mcp-transport` | — | `streamable-http` (default) / `stdio` |
